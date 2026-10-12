@@ -1,0 +1,20 @@
+# Copy to terraform.tfvars and edit as needed.
+# Defaults: the smallest DRA-capable configuration that scales inference
+# across nodes (2x trn1.2xlarge static pool). Set neuron_desired_size = 1 to
+# halve the accelerator cost when cross-node scaling isn't needed.
+
+region               = "us-east-2"
+cluster_name         = "eks-llm-inference"
+cluster_version      = "1.34" # Must be 1.34+ for DRA. Do not lower.
+
+# Smallest DRA-capable Neuron instance: 1 Trainium chip, 2 NeuronCores.
+# NOTE: inf2 (Inferentia2) is NOT supported by the Neuron DRA driver (its node
+# affinity excludes inf* instance types). In us-east-2, trn1.2xlarge is only
+# offered in us-east-2c; main.tf selects a matching AZ automatically.
+neuron_instance_type = "trn1.2xlarge"
+neuron_desired_size  = 2
+neuron_max_size      = 2
+
+# For larger models (connected device subsets, LNC, UltraServer), switch to:
+#   neuron_instance_type = "trn2.48xlarge"
+# (far more expensive and capacity-constrained; request quota first).

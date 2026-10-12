@@ -1,0 +1,88 @@
+# =============================================================================
+# Chat front end: a browser UI in front of the self-hosted model
+#
+# Open WebUI (open source) runs in the cluster and calls the Ray Serve
+# endpoint over the in-cluster Service, so model traffic never goes through a
+# port-forward. Only your browser does:
+#
+#   kubectl apply -f manifests/03-chat-ui.yaml
+#   kubectl rollout status deploy/open-webui
+#   kubectl port-forward svc/open-webui 3000:80      # then open http://localhost:3000
+#
+# SECURITY: login is disabled (WEBUI_AUTH=false) for single-user local access.
+# That is only acceptable because the Service is ClusterIP and the
+# port-forward binds to 127.0.0.1. Do not expose this Service through a
+# LoadBalancer or Ingress without turning auth back on.
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: open-webui
+  namespace: default
+  labels: { app: open-webui }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: open-webui }
+  template:
+    metadata:
+      labels: { app: open-webui }
+    spec:
+      nodeSelector:
+        role: system
+      containers:
+        - name: open-webui
+          # Pinned. v0.11.4 (2026-09-21) is the version this stack was
+          # validated with; v0.12.0 had been out for one day at the time.
+          image: ghcr.io/open-webui/open-webui:v0.11.4
+          ports:
+            - { containerPort: 8080, name: http }
+          env:
+            # The Ray Serve endpoint. Any non-empty API key works; the endpoint
+            # is only reachable inside the cluster.
+            - { name: OPENAI_API_BASE_URL, value: "http://vllm-llm-serve-svc.default.svc.cluster.local:8000/v1" }
+            - { name: OPENAI_API_KEY, value: "not-used" }
+            - { name: DEFAULT_MODELS, value: "Qwen/Qwen2.5-1.5B-Instruct" }
+            - { name: ENABLE_OLLAMA_API, value: "false" }
+            - { name: ENABLE_EVALUATION_ARENA_MODELS, value: "false" }
+            # Single-user local access: no login screen. See SECURITY note above.
+            - { name: WEBUI_AUTH, value: "false" }
+            # Don't send hidden background requests (titles, tags, follow-ups)
+            # to the model: they add load on the accelerators and skew the
+            # autoscaling and latency numbers.
+            - { name: ENABLE_TITLE_GENERATION, value: "false" }
+            - { name: ENABLE_TAGS_GENERATION, value: "false" }
+            - { name: ENABLE_FOLLOW_UP_GENERATION, value: "false" }
+            - { name: ENABLE_RETRIEVAL_QUERY_GENERATION, value: "false" }
+            # Plain chat only. For browser sessions, Open WebUI 0.11 attaches
+            # its built-in tools (web search, knowledge, code, ...) as native
+            # OpenAI function calls with tool_choice "auto". vLLM rejects those
+            # with HTTP 400 unless it was started with --enable-auto-tool-choice
+            # and a --tool-call-parser, and a 1.5B model is a poor tool caller
+            # anyway. These defaults apply to every model the UI lists.
+            - { name: DEFAULT_MODEL_METADATA, value: '{"capabilities":{"builtin_tools":false}}' }
+            - { name: DEFAULT_MODEL_PARAMS, value: '{"function_calling":"legacy"}' }
+            # Use the embedding model baked into the image; no Hugging Face
+            # downloads or update checks at startup.
+            - { name: OFFLINE_MODE, value: "true" }
+            # Env vars always win; nothing is persisted between restarts.
+            - { name: ENABLE_PERSISTENT_CONFIG, value: "false" }
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 15
+            periodSeconds: 5
+            failureThreshold: 60
+          resources:
+            requests: { cpu: 250m, memory: 1Gi }
+            limits: { memory: 2Gi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: open-webui
+  namespace: default
+spec:
+  type: ClusterIP
+  selector: { app: open-webui }
+  ports:
+    - { name: http, port: 80, targetPort: http }

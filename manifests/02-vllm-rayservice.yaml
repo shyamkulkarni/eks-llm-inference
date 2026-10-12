@@ -1,0 +1,247 @@
+# =============================================================================
+# Inference service: an open-weights model served by vLLM on Ray Serve,
+# deployed and scaled by KubeRay, with Trainium allocated through DRA.
+#
+# PREREQUISITE — ship the Serve app as a ConfigMap (source of truth is
+# manifests/serve_app.py, so there is only one copy to maintain):
+#
+#   kubectl create configmap vllm-serve-app \
+#     --from-file=serve_app.py=manifests/serve_app.py \
+#     --dry-run=client -o yaml | kubectl apply -f -
+#
+# Then:
+#   kubectl apply -f manifests/02-vllm-rayservice.yaml
+#   kubectl get rayservice vllm-llm -w
+#
+# HOW THE PIECES FIT
+#   * The Ray HEAD runs on a general-purpose node. It needs no accelerator: it
+#     runs the Serve controller and the HTTP proxy.
+#   * The Ray WORKER runs on the Trainium node and claims the Neuron device
+#     through DRA — a ResourceClaimTemplate with a CEL selector, NOT the
+#     `aws.amazon.com/neuron` integer the device plugin used to advertise. The
+#     device plugin is not installed on this cluster.
+#   * Ray natively detects the chip's 2 NeuronCores. Each Serve replica asks for
+#     ONE core, so two replicas bin-pack onto a single Trainium chip and Ray
+#     pins each one with NEURON_RT_VISIBLE_CORES.
+#   * Model weights and the Neuron compile cache live on a host directory, so a
+#     replica restart does not re-download or re-compile. After the first
+#     start on a node, new replicas there are serving in under a minute.
+# =============================================================================
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: neuron-device-claim
+  namespace: default
+spec:
+  spec:
+    devices:
+      requests:
+        - name: neuron
+          exactly:
+            deviceClassName: neuron.aws.com
+            # Declarative selection (same as 01-dra-resourceclaim.yaml):
+            # describe the hardware, don't name a physical device.
+            selectors:
+              - cel:
+                  expression: 'device.attributes["neuron.aws.com"].instanceType == "trn1.2xlarge"'
+            allocationMode: ExactCount
+            count: 1
+---
+apiVersion: ray.io/v1
+kind: RayService
+metadata:
+  name: vllm-llm
+  namespace: default
+spec:
+  serveConfigV2: |
+    applications:
+      - name: llm
+        route_prefix: /
+        import_path: serve_app:app
+        runtime_env:
+          env_vars:
+            PYTHONPATH: /app
+            MODEL_ID: Qwen/Qwen2.5-1.5B-Instruct
+            MAX_MODEL_LEN: "2048"
+            MAX_NUM_SEQS: "8"
+            # All three flags are required on this image (vLLM 0.16 +
+            # vLLM-Neuron 0.5.3); see serve_app.py for the failure each one
+            # prevents. 512 = MAX_NUM_SEQS * MAX_MODEL_LEN / block size.
+            VLLM_EXTRA_ARGS: "--block-size 32 --no-async-scheduling --num-gpu-blocks-override 512"
+  rayClusterConfig:
+    rayVersion: "2.57.0"
+    # Pod-level scaling: the Ray CLUSTER autoscaler (separate from Ray Serve's replica
+    # autoscaling). When Serve wants more replicas than there are free
+    # NeuronCores, this sidecar asks KubeRay for another worker pod, which
+    # claims a Trainium device on another node through DRA. It adds PODS, not
+    # EC2 instances: the Trainium nodes are a pre-sized static pool.
+    enableInTreeAutoscaling: true
+    autoscalerOptions:
+      # Remove an idle extra worker 2 min after its replicas scale away.
+      idleTimeoutSeconds: 120
+      upscalingMode: Default
+      # Sized to fit next to the Ray head on an m6i.large.
+      resources:
+        requests: { cpu: 200m, memory: 512Mi }
+        limits: { cpu: 500m, memory: 512Mi }
+      # Same ray[default] extras the head and workers need (see initContainers).
+      env:
+        - { name: PYTHONPATH, value: /pydeps }
+      volumeMounts:
+        - { name: pydeps, mountPath: /pydeps }
+    headGroupSpec:
+      rayStartParams:
+        dashboard-host: "0.0.0.0"
+      template:
+        spec:
+          nodeSelector:
+            role: system
+          volumes:
+            - name: serve-app
+              configMap:
+                name: vllm-serve-app
+            - name: pydeps
+              emptyDir: {}
+            - name: dshm
+              emptyDir:
+                medium: Memory
+                sizeLimit: 2Gi
+          initContainers:
+            # The Neuron DLC ships Ray CORE only, not `ray[default]`. Without
+            # these packages the Ray dashboard agent loads zero modules, so the
+            # healthz endpoint on :52365 never opens, the kubelet liveness probe
+            # kills the container, and the cluster restart-loops. These are the
+            # exact extras `ray[default]`/`ray[serve]` 2.57.0 adds on top of the
+            # image (resolved with `pip install --dry-run --report`); `ray`
+            # itself is deliberately NOT reinstalled.
+            - name: install-ray-extras
+              image: public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.16.0-neuronx-py312-sdk2.31.1-ubuntu24.04
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  set -euo pipefail
+                  pip install --quiet --target=/pydeps --no-deps \
+                    aiohttp-cors==0.8.1 colorful==0.5.8 distlib==0.4.3 \
+                    google-api-core==2.42.0 google-auth==2.61.0 \
+                    googleapis-common-protos==1.75.5 mmh3==5.3.1 \
+                    opencensus-context==0.1.3 opencensus==0.11.4 \
+                    opentelemetry-api==1.45.1 opentelemetry-exporter-prometheus==0.66b1 \
+                    opentelemetry-proto==1.45.1 opentelemetry-sdk==1.45.1 \
+                    opentelemetry-semantic-conventions==0.66b1 proto-plus==1.29.0 \
+                    py-spy==0.4.2 pyasn1==0.6.4 pyasn1_modules==0.4.2 \
+                    smart_open==8.0.2 virtualenv==21.14.6 wrapt==2.5.0
+              volumeMounts:
+                - { name: pydeps, mountPath: /pydeps }
+          containers:
+            - name: ray-head
+              image: public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.16.0-neuronx-py312-sdk2.31.1-ubuntu24.04
+              ports:
+                - { containerPort: 6379, name: gcs }
+                - { containerPort: 8265, name: dashboard }
+                - { containerPort: 10001, name: client }
+                - { containerPort: 8000, name: serve }
+              env:
+                - name: PYTHONPATH
+                  value: /app:/pydeps
+              volumeMounts:
+                - { name: serve-app, mountPath: /app }
+                - { name: pydeps, mountPath: /pydeps }
+                - { name: dshm, mountPath: /dev/shm }
+              resources:
+                # Head + autoscaler sidecar must fit an m6i.large (1930m CPU /
+                # ~7Gi allocatable) next to the cluster's DaemonSets.
+                requests: { cpu: 800m, memory: 4Gi }
+                limits: { cpu: "1500m", memory: 5Gi }
+    workerGroupSpecs:
+      - groupName: neuron-workers
+        replicas: 1
+        minReplicas: 1
+        # One worker pod per Trainium node in the static pool (2x trn1.2xlarge).
+        maxReplicas: 2
+        # Tell the Ray autoscaler what one worker contributes. It cannot read
+        # DRA ResourceClaims and has no Neuron auto-detection, so without this
+        # it sees pending `neuron_cores` demand but never adds a worker.
+        # (Ray inside the pod detects the same 2 NeuronCores on its own.)
+        resources:
+          neuron_cores: "2"
+        rayStartParams: {}
+        template:
+          spec:
+            nodeSelector:
+              role: neuron
+            tolerations:
+              - key: "aws.amazon.com/neuron"
+                operator: "Exists"
+                effect: "NoSchedule"
+            volumes:
+              - name: serve-app
+                configMap:
+                  name: vllm-serve-app
+              - name: pydeps
+                emptyDir: {}
+              - name: model-cache
+                hostPath:
+                  path: /var/lib/llm-model-cache
+                  type: DirectoryOrCreate
+              - name: dshm
+                emptyDir:
+                  medium: Memory
+                  sizeLimit: 8Gi
+            initContainers:
+              # Same `ray[default]` gap as the head — see the note above.
+              - name: install-ray-extras
+                image: public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.16.0-neuronx-py312-sdk2.31.1-ubuntu24.04
+                command:
+                  - /bin/bash
+                  - -c
+                  - |
+                    set -euo pipefail
+                    pip install --quiet --target=/pydeps --no-deps \
+                      aiohttp-cors==0.8.1 colorful==0.5.8 distlib==0.4.3 \
+                      google-api-core==2.42.0 google-auth==2.61.0 \
+                      googleapis-common-protos==1.75.5 mmh3==5.3.1 \
+                      opencensus-context==0.1.3 opencensus==0.11.4 \
+                      opentelemetry-api==1.45.1 opentelemetry-exporter-prometheus==0.66b1 \
+                      opentelemetry-proto==1.45.1 opentelemetry-sdk==1.45.1 \
+                      opentelemetry-semantic-conventions==0.66b1 proto-plus==1.29.0 \
+                      py-spy==0.4.2 pyasn1==0.6.4 pyasn1_modules==0.4.2 \
+                      smart_open==8.0.2 virtualenv==21.14.6 wrapt==2.5.0
+                volumeMounts:
+                  - { name: pydeps, mountPath: /pydeps }
+            containers:
+              - name: ray-worker
+                image: public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.16.0-neuronx-py312-sdk2.31.1-ubuntu24.04
+                env:
+                  - name: PYTHONPATH
+                    value: /app:/pydeps
+                  - name: HF_HOME
+                    value: /cache/hf
+                  # Persist compiled Neuron graphs so restarts are fast.
+                  - name: NEURON_COMPILE_CACHE_URL
+                    value: /cache/neuron-compile
+                  - name: MY_POD_IP
+                    valueFrom:
+                      fieldRef: { fieldPath: status.podIP }
+                volumeMounts:
+                  - { name: serve-app, mountPath: /app }
+                  - { name: pydeps, mountPath: /pydeps }
+                  - { name: model-cache, mountPath: /cache }
+                  - { name: dshm, mountPath: /dev/shm }
+                resources:
+                  requests: { cpu: "6", memory: 24Gi }
+                  limits: { memory: 28Gi }
+                  # The Trainium device, requested declaratively via DRA.
+                  claims:
+                    - name: neuron
+            resourceClaims:
+              - name: neuron
+                resourceClaimTemplateName: neuron-device-claim
+# Endpoints: KubeRay creates these Services itself, with names that stay
+# stable across RayService upgrades (the RayCluster underneath gets a hashed
+# name like vllm-llm-d9pfh, so don't select on ray.io/cluster yourself):
+#   vllm-llm-serve-svc :8000  -> OpenAI-compatible API (pods with ray.io/serve=true)
+#   vllm-llm-head-svc  :8265  -> Ray dashboard
+#
+#   kubectl port-forward svc/vllm-llm-serve-svc 8000:8000
+#   kubectl port-forward svc/vllm-llm-head-svc 8265:8265

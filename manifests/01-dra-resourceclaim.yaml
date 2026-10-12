@@ -1,0 +1,65 @@
+# =============================================================================
+# DRA validation: declarative Trainium allocation, in isolation
+#
+# Instead of asking for an opaque `aws.amazon.com/neuron: 1` integer, the
+# workload DESCRIBES the hardware it needs with a CEL expression, and the
+# scheduler matches it against the ResourceSlices the Neuron DRA driver
+# publishes. Use this to confirm DRA works on a node before deploying the
+# inference service.
+#
+# Inspect the device inventory:
+#   kubectl get resourceslice
+#   kubectl get deviceclass neuron.aws.com
+#
+# Then apply this and confirm the pod gets exactly the device it asked for.
+# It needs a free Trainium chip, so run it before the inference service
+# claims every device (or it stays Pending: "cannot allocate all claims").
+#   kubectl apply -f 01-dra-resourceclaim.yaml
+#   kubectl get pod neuron-dra-smoketest -w
+#   kubectl logs neuron-dra-smoketest   # neuron-ls output proves the device is attached
+# =============================================================================
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: neuron-single
+  namespace: default
+spec:
+  spec:
+    devices:
+      requests:
+        - name: neuron
+          exactly:
+            deviceClassName: neuron.aws.com
+            # Declarative selection: "give me a Neuron device on a trn1.2xlarge".
+            # The driver publishes the unqualified attribute `instanceType`
+            # (see `kubectl get resourceslice -o yaml`); CEL resolves it under
+            # the driver domain neuron.aws.com. Swap the string if you deployed
+            # a different Trainium type (e.g. trn2.48xlarge).
+            selectors:
+              - cel:
+                  expression: 'device.attributes["neuron.aws.com"].instanceType == "trn1.2xlarge"'
+            allocationMode: ExactCount
+            count: 1
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: neuron-dra-smoketest
+  namespace: default
+spec:
+  restartPolicy: Never
+  # Tolerate the taint on the Neuron node group.
+  tolerations:
+    - key: "aws.amazon.com/neuron"
+      operator: "Exists"
+      effect: "NoSchedule"
+  containers:
+    - name: neuron-ls
+      image: public.ecr.aws/g4h4h0b5/neuron-monitor:1.0.0
+      command: ["/bin/sh", "-c", "neuron-ls && sleep 30"]
+      resources:
+        claims:
+          - name: neuron
+  resourceClaims:
+    - name: neuron
+      resourceClaimTemplateName: neuron-single

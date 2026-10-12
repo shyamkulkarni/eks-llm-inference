@@ -1,0 +1,29 @@
+# Terraform working files. State, backups and saved plans contain the AWS
+# account ID, resource ARNs, the creator's IAM identity and the cluster CA,
+# so they must never be committed. Keep .terraform.lock.hcl (it pins providers).
+.terraform/
+*.tfstate
+*.tfstate.*
+tfplan*
+*.tfplan
+terraform.tfvars
+*.auto.tfvars
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+crash.log
+crash.*.log
+
+# Command output captured while building and debugging.
+*.log
+
+# Local-only working notes. README.md is the only top-level doc published.
+.agents/
+/*.md
+!/README.md
+
+# OS / editor noise.
+.DS_Store
+.vscode/
+.idea/
